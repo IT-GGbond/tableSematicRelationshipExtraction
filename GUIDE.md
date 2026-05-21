@@ -68,7 +68,7 @@ python baseline/train.py \
 python baseline/infer.py \
     --input_csv ./dataset/test.csv \
     --labels_path ./dataset/labels.txt \
-    --model_path ./cpa_output/填入实际生成的时间戳文件夹名/best_model.pdparams \
+    --model_path ./cpa_output/cpa_20260521_150928/best_model.pdparams \
     --output_file ./submission.csv
 ```
 
