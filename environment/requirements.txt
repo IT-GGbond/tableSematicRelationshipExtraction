@@ -1,5 +1,5 @@
 paddlenlp>=2.8.0
-paddlepaddle-gpu>=3.0.0
+paddlepaddle-gpu>=2.6.0
 pandas>=2.0.0
 numpy>=1.26.0
 scikit-learn>=1.5.0
