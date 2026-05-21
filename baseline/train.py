@@ -254,11 +254,21 @@ def run_training(args):
     )
 
     # 5. model init
+    # Calculate competition-specific focal weights
+    counts_max = counts.max()
+    counts_min = counts.min()
+    class_weights = []
+    for cls_name in label_encoder.classes_:
+        count_m = counts.get(cls_name, counts_min)
+        weight_m = (counts_max - count_m + counts_min * 0.1) / (counts_max + counts_min * 0.1)
+        class_weights.append(weight_m)
+    class_weights_tensor = paddle.to_tensor(class_weights, dtype='float32')
+    
     model = CPAModel(args.shortcut_name, num_classes, args.use_flash_attention)
     total_steps = max(1, len(train_loader) * args.epoch)
     lr_scheduler = LinearDecayWithWarmup(args.lr, total_steps, warmup=args.warmup_ratio)
     optimizer = paddle.optimizer.AdamW(learning_rate=lr_scheduler, parameters=model.parameters())
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor)
 
     use_amp = args.use_amp and str(device) != 'cpu'
     scaler = paddle.amp.GradScaler(init_loss_scaling=1024) if use_amp else None
@@ -306,7 +316,8 @@ def run_training(args):
 
         # val stage
         model.eval()
-        val_correct, val_total = 0, 0
+        all_preds = []
+        all_labels = []
         with paddle.no_grad():
             for batch in val_loader:
                 if batch is None:
@@ -323,15 +334,33 @@ def run_training(args):
                     logits = model(input_ids, mask)
 
                 preds = paddle.argmax(logits, axis=1)
-                val_correct += int((preds == label_ids).astype('int64').sum().numpy())
-                val_total += int(label_ids.shape[0])
+                all_preds.extend(preds.numpy().tolist())
+                all_labels.extend(label_ids.numpy().tolist())
+
+        from collections import defaultdict
+        m_correct = defaultdict(int)
+        m_total = defaultdict(int)
+        for p, l in zip(all_preds, all_labels):
+            m_total[l] += 1
+            if p == l:
+                m_correct[l] += 1
+        
+        score_num = 0.0
+        score_den = 0.0
+        for l_idx, w in enumerate(class_weights):
+            if m_total[l_idx] > 0:
+                m_score = m_correct[l_idx] / m_total[l_idx]
+            else:
+                m_score = 0.0
+            score_num += w * m_score
+            score_den += w
+        val_score = score_num / score_den if score_den > 0 else 0.0
 
         avg_train_loss = tr_loss / max(1, train_steps)
-        val_acc = val_correct / val_total if val_total > 0 else 0.0
-        logging.info(f'Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Acc: {val_acc:.4f}')
+        logging.info(f'Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Score (Weighted): {val_score:.4f}')
 
-        if val_acc > best_acc:
-            best_acc = val_acc
+        if val_score > best_acc:
+            best_acc = val_score
             patience_counter = 0
             paddle.save(model.state_dict(), os.path.join(save_dir, 'best_model.pdparams'))
             try:
