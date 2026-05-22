@@ -3,11 +3,13 @@ import os
 import random
 import logging
 from datetime import datetime
+from collections import Counter
 
 import numpy as np
 import pandas as pd
 import paddle
 import paddle.nn as nn
+import paddle.nn.functional as F
 from paddle.io import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -15,7 +17,9 @@ from tqdm import tqdm
 
 from paddlenlp.transformers import AutoTokenizer, AutoModel, LinearDecayWithWarmup
 
-# data load
+# ---------------------------------------------------------------------------
+# 1. Data loading
+# ---------------------------------------------------------------------------
 def load_data_from_directory(dir_path):
     all_data = []
     if not os.path.exists(dir_path):
@@ -47,24 +51,40 @@ def load_data_from_directory(dir_path):
     full_df['Object'] = full_df['Object'].astype(str)
     return full_df
 
-# encode data
-def encode_text(tokenizer, text_input, max_length):
+
+# ---------------------------------------------------------------------------
+# 2. Text encoding  (text-pair, consistent with infer.py)
+# ---------------------------------------------------------------------------
+def encode_text_pair(tokenizer, text_a, text_b, max_length):
+    """Tokenize a subject-object pair. Tries text_pair first, falls back gracefully."""
     try:
         encoding = tokenizer(
-            text_input,
+            text=text_a,
+            text_pair=text_b,
             max_length=max_length,
             padding='max_length',
             truncation=True,
             return_attention_mask=True,
         )
     except TypeError:
-        encoding = tokenizer(
-            text=text_input,
-            max_seq_len=max_length,
-            pad_to_max_seq_len=True,
-            truncation=True,
-            return_attention_mask=True,
-        )
+        try:
+            encoding = tokenizer(
+                text_a,
+                text_b,
+                max_length=max_length,
+                padding='max_length',
+                truncation=True,
+                return_attention_mask=True,
+            )
+        except TypeError:
+            encoding = tokenizer(
+                text=text_a,
+                text_pair=text_b,
+                max_seq_len=max_length,
+                pad_to_max_seq_len=True,
+                truncation=True,
+                return_attention_mask=True,
+            )
 
     input_ids = encoding['input_ids']
     attention_mask = encoding.get('attention_mask', None)
@@ -76,9 +96,12 @@ def encode_text(tokenizer, text_input, max_length):
 
     return np.array(input_ids, dtype='int64'), np.array(attention_mask, dtype='int64')
 
-# dataset
+
+# ---------------------------------------------------------------------------
+# 3. Dataset
+# ---------------------------------------------------------------------------
 class RelationDataset(Dataset):
-    def __init__(self, dataframe, tokenizer, label_encoder, max_length=128):
+    def __init__(self, dataframe, tokenizer, label_encoder, max_length=256):
         self.data = dataframe.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.le = label_encoder
@@ -89,8 +112,12 @@ class RelationDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
-        text_input = f"{row['Subject']} [SEP] {row['Object']}"
-        input_ids, attention_mask = encode_text(self.tokenizer, text_input, self.max_length)
+        # Natural-language prompt to trigger pretrained knowledge
+        text_a = f"Subject: {row['Subject']}"
+        text_b = f"Object: {row['Object']}"
+        input_ids, attention_mask = encode_text_pair(
+            self.tokenizer, text_a, text_b, self.max_length
+        )
         label_id = self.le.transform([row['label']])[0]
         return {
             'valid': True,
@@ -98,6 +125,7 @@ class RelationDataset(Dataset):
             'cls_mask': attention_mask,
             'label_id': np.int64(label_id),
         }
+
 
 def dynamic_collate_fn(samples):
     valid_samples = [s for s in samples if s.get('valid', False)]
@@ -110,12 +138,41 @@ def dynamic_collate_fn(samples):
         'cls_mask': np.stack([s['cls_mask'] for s in valid_samples]).astype('int64'),
     }
 
-# model
+
+# ---------------------------------------------------------------------------
+# 4. Focal Loss  –  sharpens focus on rare / hard examples
+# ---------------------------------------------------------------------------
+class FocalLoss(nn.Layer):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha          # Tensor of class weights  [num_classes]
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits, labels):
+        ce_loss = F.cross_entropy(logits, labels, weight=None, reduction='none')
+        pt = paddle.exp(-ce_loss)                    # p_t  for the true class
+        focal = ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.alpha is not None:
+            alpha_t = self.alpha[labels]             # gather per-sample weight
+            focal = alpha_t * focal
+
+        if self.reduction == 'mean':
+            return focal.mean()
+        elif self.reduction == 'sum':
+            return focal.sum()
+        return focal
+
+
+# ---------------------------------------------------------------------------
+# 5. Model
+# ---------------------------------------------------------------------------
 class CPAModel(nn.Layer):
-    def __init__(self, model_name, num_labels, use_flash_attn=False):
+    def __init__(self, model_name, num_labels, dropout=0.1):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(model_name)
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(dropout)
 
         hidden_size = None
         if hasattr(self.encoder, 'config'):
@@ -128,12 +185,9 @@ class CPAModel(nn.Layer):
             hidden_size = self.encoder.embeddings.word_embeddings.weight.shape[-1]
 
         if hidden_size is None:
-            raise ValueError('hidden_size in None')
+            raise ValueError('hidden_size is None')
 
         self.classifier = nn.Linear(hidden_size, num_labels)
-
-        if use_flash_attn:
-            logging.warning('flash attention not activate')
 
     def forward(self, input_ids, attention_mask):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
@@ -149,13 +203,16 @@ class CPAModel(nn.Layer):
         logits = self.classifier(self.dropout(cls_embedding))
         return logits
 
-# seed
+
+# ---------------------------------------------------------------------------
+# 6. Utilities
+# ---------------------------------------------------------------------------
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     paddle.seed(seed)
 
-# log
+
 def setup_logging(save_dir):
     os.makedirs(save_dir, exist_ok=True)
     logging.basicConfig(
@@ -167,15 +224,14 @@ def setup_logging(save_dir):
         ],
     )
 
-# device
+
 def resolve_device(device_arg):
     try:
         custom_types = paddle.device.get_all_custom_device_type()
     except Exception:
         custom_types = []
-
     logging.info(f'custom device types: {custom_types}')
-    
+
     if device_arg:
         try:
             dev = paddle.set_device(device_arg)
@@ -183,19 +239,37 @@ def resolve_device(device_arg):
             return dev
         except Exception as e:
             logging.warning(f'{device_arg} use error: {e}')
-            
+
     dev = paddle.set_device('cpu')
     logging.warning('set device to CPU')
     return dev
 
-# labels
+
 def save_label_classes(label_encoder, save_dir):
     path = os.path.join(save_dir, 'label_classes.txt')
     with open(path, 'w', encoding='utf-8') as f:
         for label in label_encoder.classes_:
             f.write(f'{label}\n')
 
-# train
+
+def oversample_rare_classes(df, min_count=10, max_multiplier=10):
+    """Repeat samples of classes whose count < min_count to reach at least min_count."""
+    counts = df['label'].value_counts()
+    dfs = [df]
+    for label, cnt in counts.items():
+        if cnt < min_count:
+            subset = df[df['label'] == label]
+            repeat = min(max_multiplier, min_count // max(cnt, 1))
+            if repeat > 1:
+                for _ in range(repeat - 1):
+                    dfs.append(subset)
+    result = pd.concat(dfs, ignore_index=True)
+    return result.sample(frac=1, random_state=42).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 7. Training loop
+# ---------------------------------------------------------------------------
 def run_training(args):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     save_dir = os.path.join(args.output_dir, f'cpa_{timestamp}')
@@ -204,18 +278,23 @@ def run_training(args):
     device = resolve_device(args.device)
 
     logging.info(f'device: {device}')
+    logging.info(f'model: {args.shortcut_name}')
 
-    # 1. load train data
+    # ---- 7a. Load data ----
     raw_train_df = load_data_from_directory(args.train_dir)
 
-    # 2. bulid lable
+    # ---- 7b. Build label encoder ----
     label_encoder = LabelEncoder()
     label_encoder.fit(raw_train_df['label'].unique())
     num_classes = len(label_encoder.classes_)
     logging.info(f'label_num: {num_classes}')
     save_label_classes(label_encoder, save_dir)
 
-    # 3. split dataset
+    # ---- 7c. Rare-class oversampling ----
+    raw_train_df = oversample_rare_classes(raw_train_df, min_count=10, max_multiplier=10)
+    logging.info(f'after oversampling: {len(raw_train_df)} rows')
+
+    # ---- 7d. Split dataset ----
     counts = raw_train_df['label'].value_counts()
     rare_labels = counts[counts < 2].index
     df_rare = raw_train_df[raw_train_df['label'].isin(rare_labels)]
@@ -234,7 +313,7 @@ def run_training(args):
     val_df = val_c.reset_index(drop=True)
     logging.info(f'split success: train={len(train_df)}, val={len(val_df)}')
 
-    # 4. Tokenizer & DataLoader
+    # ---- 7e. Tokenizer & DataLoader ----
     tokenizer = AutoTokenizer.from_pretrained(args.shortcut_name)
     train_loader = DataLoader(
         RelationDataset(train_df, tokenizer, label_encoder, args.max_length),
@@ -253,8 +332,8 @@ def run_training(args):
         return_list=True,
     )
 
-    # 5. model init
-    # Calculate competition-specific focal weights
+    # ---- 7f. Competition-based class weights & Focal Loss ----
+    counts = raw_train_df['label'].value_counts()
     counts_max = counts.max()
     counts_min = counts.min()
     class_weights = []
@@ -263,20 +342,24 @@ def run_training(args):
         weight_m = (counts_max - count_m + counts_min * 0.1) / (counts_max + counts_min * 0.1)
         class_weights.append(weight_m)
     class_weights_tensor = paddle.to_tensor(class_weights, dtype='float32')
-    
-    model = CPAModel(args.shortcut_name, num_classes, args.use_flash_attention)
+
+    # ---- 7g. Model, optimizer, scheduler ----
+    model = CPAModel(args.shortcut_name, num_classes, args.dropout)
     total_steps = max(1, len(train_loader) * args.epoch)
     lr_scheduler = LinearDecayWithWarmup(args.lr, total_steps, warmup=args.warmup_ratio)
-    optimizer = paddle.optimizer.AdamW(learning_rate=lr_scheduler, parameters=model.parameters())
-    loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor)
+    optimizer = paddle.optimizer.AdamW(
+        learning_rate=lr_scheduler,
+        parameters=model.parameters(),
+        weight_decay=args.weight_decay,
+    )
+    loss_fn = FocalLoss(alpha=class_weights_tensor, gamma=args.focal_gamma)
 
     use_amp = args.use_amp and str(device) != 'cpu'
     scaler = paddle.amp.GradScaler(init_loss_scaling=1024) if use_amp else None
 
-    # 6. training
-    best_acc = 0.0
+    # ---- 7h. Training loop ----
+    best_score = 0.0
     patience_counter = 0
-    patience_limit = args.patience
 
     logging.info('start training...')
     for epoch in range(args.epoch):
@@ -314,7 +397,7 @@ def run_training(args):
             train_steps += 1
             pbar.set_postfix({'loss': f'{loss_value:.4f}'})
 
-        # val stage
+        # ---- Validation ----
         model.eval()
         all_preds = []
         all_labels = []
@@ -337,6 +420,7 @@ def run_training(args):
                 all_preds.extend(preds.numpy().tolist())
                 all_labels.extend(label_ids.numpy().tolist())
 
+        # Competition metric:  per-class weighted score
         from collections import defaultdict
         m_correct = defaultdict(int)
         m_total = defaultdict(int)
@@ -344,7 +428,7 @@ def run_training(args):
             m_total[l] += 1
             if p == l:
                 m_correct[l] += 1
-        
+
         score_num = 0.0
         score_den = 0.0
         for l_idx, w in enumerate(class_weights):
@@ -359,41 +443,43 @@ def run_training(args):
         avg_train_loss = tr_loss / max(1, train_steps)
         logging.info(f'Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Score (Weighted): {val_score:.4f}')
 
-        if val_score > best_acc:
-            best_acc = val_score
+        if val_score > best_score:
+            best_score = val_score
             patience_counter = 0
             paddle.save(model.state_dict(), os.path.join(save_dir, 'best_model.pdparams'))
             try:
                 tokenizer.save_pretrained(save_dir)
             except Exception:
                 pass
-            logging.info(f'best model! (Acc: {best_acc:.4f})')
+            logging.info(f'best model! (Score: {best_score:.4f})')
         else:
             patience_counter += 1
-            logging.info(f'early stop count: {patience_counter}/{patience_limit}')
-            if patience_counter == patience_limit:
-                logging.info(f'{patience_limit} epoch not up, early stop!!!')
+            logging.info(f'early stop count: {patience_counter}/{args.patience}')
+            if patience_counter >= args.patience:
+                logging.info(f'{args.patience} epoch not up, early stop!')
                 break
 
-    logging.info(f'train finish, best acc: {best_acc:.4f}')
+    logging.info(f'train finish, best score: {best_score:.4f}')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_dir', type=str, default="./dataset/Train_Set")
     parser.add_argument('--output_dir', type=str, default='./cpa_output')
-    parser.add_argument('--shortcut_name', type=str, default='bert-base-uncased')
+    parser.add_argument('--shortcut_name', type=str, default='roberta-base')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epoch', type=int, default=20)
-    parser.add_argument('--lr', type=float, default=5e-5)
-    parser.add_argument('--max_length', type=int, default=128)
+    parser.add_argument('--lr', type=float, default=3e-5)
+    parser.add_argument('--max_length', type=int, default=256)
     parser.add_argument('--random_seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=0)
-    parser.add_argument('--use_flash_attention', action='store_true')
     parser.add_argument('--use_amp', action='store_true')
     parser.add_argument('--warmup_ratio', type=float, default=0.1)
-    parser.add_argument('--patience', type=int, default=3)
+    parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--val_ratio', type=float, default=0.1)
     parser.add_argument('--device', type=str, default='gpu')
+    parser.add_argument('--focal_gamma', type=float, default=2.0)
+    parser.add_argument('--weight_decay', type=float, default=0.01)
+    parser.add_argument('--dropout', type=float, default=0.2)
     args = parser.parse_args()
     run_training(args)

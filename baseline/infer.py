@@ -31,7 +31,7 @@ class CPAModel(nn.Layer):
             hidden_size = self.encoder.embeddings.word_embeddings.weight.shape[-1]
 
         if hidden_size is None:
-            raise ValueError('Unable to infer hidden_size automatically. Please check the pretrained model.')
+            raise ValueError('Unable to infer hidden_size automatically.')
 
         self.classifier = nn.Linear(hidden_size, num_labels)
 
@@ -51,10 +51,9 @@ class CPAModel(nn.Layer):
 
 
 # ==========================================
-# 2. Tokenization helper
+# 2. Tokenization  (matches train.py exactly)
 # ==========================================
-def encode_pair(tokenizer, text_a, text_b, max_length):
-    """Handle text-pair tokenization across different PaddleNLP versions."""
+def encode_text_pair(tokenizer, text_a, text_b, max_length):
     try:
         encoding = tokenizer(
             text=text_a,
@@ -96,22 +95,18 @@ def encode_pair(tokenizer, text_a, text_b, max_length):
 
 
 # ==========================================
-# 3. Single-table inference dataset
+# 3. Inference dataset
 # ==========================================
-class SingleTableInferenceDataset(Dataset):
-    def __init__(self, csv_path, tokenizer, max_length=128):
+class InferenceDataset(Dataset):
+    def __init__(self, csv_path, tokenizer, max_length=256):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = []
         self.original_rows = []
 
-        # Read the CSV file.
         df = pd.read_csv(csv_path, low_memory=False, encoding='utf-8-sig')
-
-        # Normalize column names by trimming whitespace.
         df.columns = [str(col).strip() for col in df.columns]
 
-        # Locate Subject and Object columns in a case-insensitive way.
         subject_col = None
         object_col = None
         for col in df.columns:
@@ -123,7 +118,6 @@ class SingleTableInferenceDataset(Dataset):
         if subject_col is None or object_col is None:
             raise ValueError("The CSV file must contain 'Subject' and 'Object' columns (case-insensitive).")
 
-        # Drop rows with missing Subject/Object values.
         temp_df = df[[subject_col, object_col]].dropna()
         for idx, row in temp_df.iterrows():
             self.samples.append((str(row[subject_col]), str(row[object_col])))
@@ -134,11 +128,11 @@ class SingleTableInferenceDataset(Dataset):
 
     def __getitem__(self, idx):
         subject_text, object_text = self.samples[idx]
-        input_ids, attention_mask = encode_pair(
-            self.tokenizer,
-            subject_text,
-            object_text,
-            self.max_length,
+        # Same prompt format as training
+        text_a = f"Subject: {subject_text}"
+        text_b = f"Object: {object_text}"
+        input_ids, attention_mask = encode_text_pair(
+            self.tokenizer, text_a, text_b, self.max_length
         )
         return {
             'input_ids': input_ids,
@@ -159,12 +153,10 @@ def collate_fn(samples):
 # 4. Device helper
 # ==========================================
 def resolve_device(device_arg):
-    """Try the requested device first, otherwise fall back to CPU."""
     try:
         custom_types = paddle.device.get_all_custom_device_type()
     except Exception:
         custom_types = []
-
     print(f'Available custom devices: {custom_types}')
 
     if device_arg:
@@ -186,12 +178,13 @@ def resolve_device(device_arg):
 def run_inference(args):
     device = resolve_device(args.device)
 
-    # Load label mapping.
+    # Load label mapping
     with open(args.labels_path, 'r', encoding='utf-8-sig') as f:
         classes = [line.strip() for line in f.readlines() if line.strip()]
     id2label = {idx: label for idx, label in enumerate(classes)}
+    print(f'Loaded {len(classes)} labels.')
 
-    # Initialize tokenizer and model.
+    # Initialize tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(args.shortcut_name)
     model = CPAModel(args.shortcut_name, len(classes))
 
@@ -202,8 +195,8 @@ def run_inference(args):
     model.set_state_dict(state_dict)
     model.eval()
 
-    # Load the dataset.
-    dataset = SingleTableInferenceDataset(args.input_csv, tokenizer, args.max_length)
+    # Load dataset
+    dataset = InferenceDataset(args.input_csv, tokenizer, args.max_length)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -234,7 +227,7 @@ def run_inference(args):
                 original_position = orig_indices[idx_in_batch]
                 predictions[original_position] = id2label[pred_idx]
 
-    # Reload the original CSV and attach predictions.
+    # Attach predictions to original CSV
     original_df = pd.read_csv(args.input_csv, low_memory=False, encoding='utf-8-sig')
     original_df.columns = [str(col).strip() for col in original_df.columns]
 
@@ -249,7 +242,6 @@ def run_inference(args):
     if subject_col is None or object_col is None:
         raise ValueError("The CSV file must contain 'Subject' and 'Object' columns (case-insensitive).")
 
-    # Only rows with valid Subject/Object pairs receive predictions.
     valid_mask = original_df[subject_col].notna() & original_df[object_col].notna()
     valid_indices = original_df[valid_mask].index.tolist()
 
@@ -257,19 +249,21 @@ def run_inference(args):
     for row_idx, pred_label in zip(valid_indices, predictions):
         original_df.loc[row_idx, 'Label'] = pred_label
 
-    # Save the result without modifying the source file.
-    original_df.to_csv(args.output_file, index=False, encoding='utf-8-sig')
+    # Output only the required columns
+    out_df = original_df[[subject_col, object_col, 'Label']]
+    out_df.to_csv(args.output_file, index=False, encoding='utf-8-sig')
     print(f'Inference completed. Results saved to: {args.output_file}')
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_csv', type=str, default="./test.csv")
-    parser.add_argument('--labels_path', type=str, default="./labels.txt")
-    parser.add_argument('--model_path', type=str, default="./cpa_output/cpa_20260422_191904/best_model.pdparams")
+    parser.add_argument('--input_csv', type=str, default="./dataset/test.csv")
+    parser.add_argument('--labels_path', type=str, default="./dataset/labels.txt")
+    parser.add_argument('--model_path', type=str, default="./cpa_output/cpa_20260521_150928/best_model.pdparams")
     parser.add_argument('--output_file', type=str, default='./submission.csv')
-    parser.add_argument('--shortcut_name', type=str, default='bert-base-uncased')
+    parser.add_argument('--shortcut_name', type=str, default='roberta-base')
     parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--max_length', type=int, default=512)
+    parser.add_argument('--max_length', type=int, default=256)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--device', type=str, default='gpu')
     parser.add_argument('--use_amp', action='store_true')
