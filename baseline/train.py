@@ -174,10 +174,8 @@ class CPAModel(nn.Layer):
             shape=[num_labels, hidden_size], dtype='float32',
             default_initializer=nn.initializer.XavierUniform()
         )
-        self.temperature = paddle.create_parameter(
-            shape=[1], dtype='float32',
-            default_initializer=nn.initializer.Constant(0.05)
-        )
+        # Fixed temperature (NOT learnable — avoids NaN from τ → 0)
+        self.register_buffer('temperature', paddle.to_tensor([0.05], dtype='float32'))
 
     def _get_cls(self, input_ids, attention_mask):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
@@ -380,6 +378,7 @@ def run_training(args):
     optimizer = paddle.optimizer.AdamW(
         learning_rate=lr_scheduler, parameters=model.parameters(),
         weight_decay=args.weight_decay,
+        grad_clip=paddle.nn.ClipGradByGlobalNorm(clip_norm=1.0),
     )
     ce_loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor)
     cont_loss_fn = nn.CrossEntropyLoss()  # no weight — prototypes handle class balance

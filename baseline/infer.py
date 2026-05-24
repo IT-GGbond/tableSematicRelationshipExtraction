@@ -40,10 +40,7 @@ class CPAModel(nn.Layer):
             shape=[num_labels, hidden_size], dtype='float32',
             default_initializer=nn.initializer.XavierUniform()
         )
-        self.temperature = paddle.create_parameter(
-            shape=[1], dtype='float32',
-            default_initializer=nn.initializer.Constant(0.05)
-        )
+        self.register_buffer('temperature', paddle.to_tensor([0.05], dtype='float32'))
 
     def forward(self, input_ids, attention_mask):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
