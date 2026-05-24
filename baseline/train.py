@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import paddle
 import paddle.nn as nn
+import paddle.nn.functional as F
 from paddle.io import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -55,45 +56,53 @@ def load_data_from_directory(dir_path):
 # 2. Text encoding — text-pair, consistent with infer.py
 # ---------------------------------------------------------------------------
 def encode_text_pair(tokenizer, text_a, text_b, max_length):
-    """Tokenize subject–object via text_pair. Robust across PaddleNLP versions."""
     try:
         encoding = tokenizer(
-            text=text_a,
-            text_pair=text_b,
-            max_length=max_length,
-            padding='max_length',
-            truncation=True,
-            return_attention_mask=True,
+            text=text_a, text_pair=text_b,
+            max_length=max_length, padding='max_length',
+            truncation=True, return_attention_mask=True,
         )
     except TypeError:
         try:
             encoding = tokenizer(
-                text_a,
-                text_b,
-                max_length=max_length,
-                padding='max_length',
-                truncation=True,
-                return_attention_mask=True,
+                text_a, text_b,
+                max_length=max_length, padding='max_length',
+                truncation=True, return_attention_mask=True,
             )
         except TypeError:
             encoding = tokenizer(
-                text=text_a,
-                text_pair=text_b,
-                max_seq_len=max_length,
-                pad_to_max_seq_len=True,
-                truncation=True,
-                return_attention_mask=True,
+                text=text_a, text_pair=text_b,
+                max_seq_len=max_length, pad_to_max_seq_len=True,
+                truncation=True, return_attention_mask=True,
             )
 
     input_ids = encoding['input_ids']
     attention_mask = encoding.get('attention_mask', None)
-
     if attention_mask is None:
         seq_len = encoding.get('seq_len', len(input_ids))
-        seq_len = min(seq_len, max_length)
-        attention_mask = [1] * seq_len + [0] * (max_length - seq_len)
+        attention_mask = [1] * min(seq_len, max_length) + [0] * (max_length - min(seq_len, max_length))
 
     return np.array(input_ids, dtype='int64'), np.array(attention_mask, dtype='int64')
+
+
+def encode_single_text(tokenizer, text, max_length=32):
+    """Encode a single text (used for relation name initialization)."""
+    try:
+        encoding = tokenizer(
+            text=text, max_length=max_length, padding='max_length',
+            truncation=True, return_attention_mask=True,
+        )
+    except TypeError:
+        encoding = tokenizer(
+            text=text, max_seq_len=max_length, pad_to_max_seq_len=True,
+            truncation=True, return_attention_mask=True,
+        )
+    input_ids = encoding['input_ids']
+    mask = encoding.get('attention_mask', encoding.get('attention_mask', None))
+    if mask is None:
+        seq_len = encoding.get('seq_len', len(input_ids))
+        mask = [1] * min(seq_len, max_length) + [0] * (max_length - min(seq_len, max_length))
+    return np.array(input_ids, dtype='int64'), np.array(mask, dtype='int64')
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +120,6 @@ class RelationDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
-        # Clean text-pair: raw Subject / Object, no extra prefixes
         input_ids, attention_mask = encode_text_pair(
             self.tokenizer, row['Subject'], row['Object'], self.max_length
         )
@@ -136,7 +144,7 @@ def dynamic_collate_fn(samples):
 
 
 # ---------------------------------------------------------------------------
-# 4. Model
+# 4. Model  — dual-head: classifier + contrastive prototypes
 # ---------------------------------------------------------------------------
 class CPAModel(nn.Layer):
     def __init__(self, model_name, num_labels, dropout=0.1):
@@ -150,28 +158,75 @@ class CPAModel(nn.Layer):
                 hidden_size = self.encoder.config.get('hidden_size', None)
             else:
                 hidden_size = getattr(self.encoder.config, 'hidden_size', None)
-
         if hidden_size is None and hasattr(self.encoder, 'embeddings') and hasattr(self.encoder.embeddings, 'word_embeddings'):
             hidden_size = self.encoder.embeddings.word_embeddings.weight.shape[-1]
-
         if hidden_size is None:
             raise ValueError('hidden_size is None')
 
+        self.hidden_size = hidden_size
+        self.num_labels = num_labels
+
+        # Classification head
         self.classifier = nn.Linear(hidden_size, num_labels)
 
-    def forward(self, input_ids, attention_mask):
+        # Learnable relation prototypes for contrastive learning
+        self.rel_prototypes = paddle.create_parameter(
+            shape=[num_labels, hidden_size], dtype='float32',
+            default_initializer=nn.initializer.XavierUniform()
+        )
+        self.temperature = paddle.create_parameter(
+            shape=[1], dtype='float32',
+            default_initializer=nn.initializer.Constant(0.05)
+        )
+
+    def _get_cls(self, input_ids, attention_mask):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-
         if isinstance(outputs, tuple):
-            sequence_output = outputs[0]
+            seq_out = outputs[0]
         elif hasattr(outputs, 'last_hidden_state'):
-            sequence_output = outputs.last_hidden_state
+            seq_out = outputs.last_hidden_state
         else:
-            sequence_output = outputs
+            seq_out = outputs
+        return seq_out[:, 0, :]
 
-        cls_embedding = sequence_output[:, 0, :]
-        logits = self.classifier(self.dropout(cls_embedding))
-        return logits
+    def forward(self, input_ids, attention_mask):
+        cls_emb = self._get_cls(input_ids, attention_mask)          # (B, H)
+
+        # Classification logits
+        cls_logits = self.classifier(self.dropout(cls_emb))         # (B, C)
+
+        # Contrastive logits via dot-product with relation prototypes
+        cls_norm = F.normalize(cls_emb, axis=-1)                    # (B, H)
+        proto_norm = F.normalize(self.rel_prototypes, axis=-1)      # (C, H)
+        cont_logits = cls_norm @ proto_norm.T / self.temperature    # (B, C)
+
+        return cls_logits, cont_logits
+
+    def init_prototypes_from_names(self, tokenizer, label_names, device='gpu'):
+        """Pre-compute BERT encodings of relation names as prototype initial values."""
+        logging.info('Initializing relation prototypes from BERT encodings...')
+        bert = self.encoder
+        proto_buf = []
+        bs = 64
+        for i in range(0, len(label_names), bs):
+            batch_names = label_names[i:i + bs]
+            ids_list, mask_list = [], []
+            for name in batch_names:
+                ids, mask = encode_single_text(tokenizer, name, 32)
+                ids_list.append(ids)
+                mask_list.append(mask)
+            ids_t = paddle.to_tensor(np.stack(ids_list), dtype='int64')
+            mask_t = paddle.to_tensor(np.stack(mask_list), dtype='int64')
+            with paddle.no_grad():
+                out = bert(input_ids=ids_t, attention_mask=mask_t)
+                if isinstance(out, tuple):
+                    out = out[0]
+                elif hasattr(out, 'last_hidden_state'):
+                    out = out.last_hidden_state
+                proto_buf.append(out[:, 0, :].numpy())              # (bs, H)
+        init_vals = np.concatenate(proto_buf, axis=0)               # (C, H)
+        self.rel_prototypes.set_value(paddle.to_tensor(init_vals, dtype='float32'))
+        logging.info('Prototypes initialized.')
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +256,6 @@ def resolve_device(device_arg):
     except Exception:
         custom_types = []
     logging.info(f'custom device types: {custom_types}')
-
     if device_arg:
         try:
             dev = paddle.set_device(device_arg)
@@ -209,7 +263,6 @@ def resolve_device(device_arg):
             return dev
         except Exception as e:
             logging.warning(f'{device_arg} use error: {e}')
-
     dev = paddle.set_device('cpu')
     logging.warning('set device to CPU')
     return dev
@@ -223,7 +276,6 @@ def save_label_classes(label_encoder, save_dir):
 
 
 def oversample_rare_classes(df, min_count=10, max_multiplier=10):
-    """Repeat samples of classes with count < min_count to improve coverage."""
     counts = df['label'].value_counts()
     dfs = [df]
     for label, cnt in counts.items():
@@ -238,7 +290,19 @@ def oversample_rare_classes(df, min_count=10, max_multiplier=10):
 
 
 # ---------------------------------------------------------------------------
-# 6. Training loop
+# 6. R-Drop consistency loss
+# ---------------------------------------------------------------------------
+def rdrop_loss(logits1, logits2, alpha=0.5):
+    """KL divergence between two forward-pass output distributions."""
+    p1 = F.softmax(logits1, axis=-1)
+    p2 = F.softmax(logits2, axis=-1)
+    kl_12 = F.kl_div(F.log_softmax(logits1, axis=-1), p2, reduction='batchmean')
+    kl_21 = F.kl_div(F.log_softmax(logits2, axis=-1), p1, reduction='batchmean')
+    return alpha * (kl_12 + kl_21) / 2.0
+
+
+# ---------------------------------------------------------------------------
+# 7. Training loop
 # ---------------------------------------------------------------------------
 def run_training(args):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -249,19 +313,19 @@ def run_training(args):
 
     logging.info(f'device: {device}')
     logging.info(f'model: {args.shortcut_name}')
+    logging.info(f'contrastive_alpha: {args.contrastive_alpha}, rdrop_alpha: {args.rdrop_alpha}')
 
-    # ---- 6a. Load data ----
+    # ---- 7a. Load data ----
     raw_train_df = load_data_from_directory(args.train_dir)
 
-    # ---- 6b. Build label encoder ----
+    # ---- 7b. Build label encoder ----
     label_encoder = LabelEncoder()
     label_encoder.fit(raw_train_df['label'].unique())
     num_classes = len(label_encoder.classes_)
     logging.info(f'label_num: {num_classes}')
     save_label_classes(label_encoder, save_dir)
 
-    # ---- 6c. Save ORIGINAL class distribution for competition weights ----
-    # MUST be done before oversampling — the scoring formula uses real counts
+    # ---- 7c. Competition weights from ORIGINAL distribution ----
     orig_counts = raw_train_df['label'].value_counts()
     counts_max = orig_counts.max()
     counts_min = orig_counts.min()
@@ -271,66 +335,59 @@ def run_training(args):
         weight_m = (counts_max - count_m + counts_min * 0.1) / (counts_max + counts_min * 0.1)
         class_weights.append(weight_m)
     class_weights_tensor = paddle.to_tensor(class_weights, dtype='float32')
-    logging.info(f'orig class distribution: max={counts_max}, min={counts_min}')
+    logging.info(f'orig distribution: max={counts_max}, min={counts_min}')
 
-    # ---- 6d. Rare-class oversampling ----
+    # ---- 7d. Oversampling ----
     raw_train_df = oversample_rare_classes(raw_train_df, min_count=10, max_multiplier=10)
     logging.info(f'after oversampling: {len(raw_train_df)} rows')
 
-    # ---- 6e. Split dataset (singletons → train) ----
+    # ---- 7e. Split ----
     after_counts = raw_train_df['label'].value_counts()
     rare_labels = after_counts[after_counts < 2].index
     df_rare = raw_train_df[raw_train_df['label'].isin(rare_labels)]
     df_common = raw_train_df[~raw_train_df['label'].isin(rare_labels)]
 
     if len(df_common) == 0:
-        raise ValueError("data num < 2, can't split dataset")
+        raise ValueError("data num < 2, can't split")
 
     train_c, val_c = train_test_split(
-        df_common,
-        test_size=args.val_ratio,
-        stratify=df_common['label'],
-        random_state=args.random_seed,
+        df_common, test_size=args.val_ratio,
+        stratify=df_common['label'], random_state=args.random_seed,
     )
     train_df = pd.concat([train_c, df_rare]).sample(frac=1, random_state=args.random_seed).reset_index(drop=True)
     val_df = val_c.reset_index(drop=True)
-    logging.info(f'split success: train={len(train_df)}, val={len(val_df)}')
+    logging.info(f'split: train={len(train_df)}, val={len(val_df)}')
 
-    # ---- 6f. Tokenizer & DataLoader ----
+    # ---- 7f. DataLoaders ----
     tokenizer = AutoTokenizer.from_pretrained(args.shortcut_name)
     train_loader = DataLoader(
         RelationDataset(train_df, tokenizer, label_encoder, args.max_length),
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=dynamic_collate_fn,
-        num_workers=args.num_workers,
-        return_list=True,
+        batch_size=args.batch_size, shuffle=True,
+        collate_fn=dynamic_collate_fn, num_workers=args.num_workers, return_list=True,
     )
     val_loader = DataLoader(
         RelationDataset(val_df, tokenizer, label_encoder, args.max_length),
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=dynamic_collate_fn,
-        num_workers=args.num_workers,
-        return_list=True,
+        batch_size=args.batch_size, shuffle=False,
+        collate_fn=dynamic_collate_fn, num_workers=args.num_workers, return_list=True,
     )
 
-    # ---- 6g. Model, optimizer, loss ----
+    # ---- 7g. Model ----
     model = CPAModel(args.shortcut_name, num_classes, args.dropout)
+    model.init_prototypes_from_names(tokenizer, list(label_encoder.classes_))
+
     total_steps = max(1, len(train_loader) * args.epoch)
     lr_scheduler = LinearDecayWithWarmup(args.lr, total_steps, warmup=args.warmup_ratio)
     optimizer = paddle.optimizer.AdamW(
-        learning_rate=lr_scheduler,
-        parameters=model.parameters(),
+        learning_rate=lr_scheduler, parameters=model.parameters(),
         weight_decay=args.weight_decay,
     )
-    # Weighted CrossEntropyLoss — competition weights favour rare classes
-    loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor)
+    ce_loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor)
+    cont_loss_fn = nn.CrossEntropyLoss()  # no weight — prototypes handle class balance
 
     use_amp = args.use_amp and str(device) != 'cpu'
     scaler = paddle.amp.GradScaler(init_loss_scaling=1024) if use_amp else None
 
-    # ---- 6h. Training ----
+    # ---- 7h. Training ----
     best_score = 0.0
     patience_counter = 0
 
@@ -351,29 +408,40 @@ def run_training(args):
 
             if use_amp:
                 with paddle.amp.auto_cast(enable=True):
-                    logits = model(input_ids, mask)
-                    loss = loss_fn(logits, label_ids)
+                    # Two forward passes for R-Drop (different dropout)
+                    cls1, cont1 = model(input_ids, mask)
+                    cls2, cont2 = model(input_ids, mask)
+
+                    ce_loss = (ce_loss_fn(cls1, label_ids) + ce_loss_fn(cls2, label_ids)) / 2.0
+                    cont_loss = (cont_loss_fn(cont1, label_ids) + cont_loss_fn(cont2, label_ids)) / 2.0
+                    rd_loss = rdrop_loss(cls1, cls2, args.rdrop_alpha)
+                    loss = ce_loss + args.contrastive_alpha * cont_loss + rd_loss
+
                 scaled = scaler.scale(loss)
                 scaled.backward()
                 scaler.minimize(optimizer, scaled)
                 optimizer.clear_grad()
             else:
-                logits = model(input_ids, mask)
-                loss = loss_fn(logits, label_ids)
+                cls1, cont1 = model(input_ids, mask)
+                cls2, cont2 = model(input_ids, mask)
+
+                ce_loss = (ce_loss_fn(cls1, label_ids) + ce_loss_fn(cls2, label_ids)) / 2.0
+                cont_loss = (cont_loss_fn(cont1, label_ids) + cont_loss_fn(cont2, label_ids)) / 2.0
+                rd_loss = rdrop_loss(cls1, cls2, args.rdrop_alpha)
+                loss = ce_loss + args.contrastive_alpha * cont_loss + rd_loss
+
                 loss.backward()
                 optimizer.step()
                 optimizer.clear_grad()
 
             lr_scheduler.step()
-            loss_value = float(loss.numpy())
-            tr_loss += loss_value
+            tr_loss += float(loss.numpy())
             train_steps += 1
-            pbar.set_postfix({'loss': f'{loss_value:.4f}'})
+            pbar.set_postfix({'loss': f'{float(loss.numpy()):.4f}'})
 
         # ---- Validation ----
         model.eval()
-        all_preds = []
-        all_labels = []
+        all_preds, all_labels = [], []
         with paddle.no_grad():
             for batch in val_loader:
                 if batch is None:
@@ -384,24 +452,24 @@ def run_training(args):
 
                 if use_amp:
                     with paddle.amp.auto_cast(enable=True):
-                        logits = model(input_ids, mask)
+                        cls_logits, cont_logits = model(input_ids, mask)
                 else:
-                    logits = model(input_ids, mask)
+                    cls_logits, cont_logits = model(input_ids, mask)
 
-                preds = paddle.argmax(logits, axis=1)
+                # Combine classifier and contrastive logits
+                final_logits = cls_logits + args.contrastive_beta * cont_logits
+                preds = paddle.argmax(final_logits, axis=1)
                 all_preds.extend(preds.numpy().tolist())
                 all_labels.extend(label_ids.numpy().tolist())
 
-        # Competition metric: per-class weighted score
-        m_correct = defaultdict(int)
-        m_total = defaultdict(int)
+        # Competition metric
+        m_correct, m_total = defaultdict(int), defaultdict(int)
         for p, l in zip(all_preds, all_labels):
             m_total[l] += 1
             if p == l:
                 m_correct[l] += 1
 
-        score_num = 0.0
-        score_den = 0.0
+        score_num, score_den = 0.0, 0.0
         for l_idx, w in enumerate(class_weights):
             if m_total[l_idx] > 0:
                 m_score = m_correct[l_idx] / m_total[l_idx]
@@ -411,8 +479,8 @@ def run_training(args):
             score_den += w
         val_score = score_num / score_den if score_den > 0 else 0.0
 
-        avg_train_loss = tr_loss / max(1, train_steps)
-        logging.info(f'Epoch {epoch + 1} | Loss: {avg_train_loss:.4f} | Val Score (Weighted): {val_score:.4f}')
+        avg_loss = tr_loss / max(1, train_steps)
+        logging.info(f'Epoch {epoch + 1} | Loss: {avg_loss:.4f} | Val Score: {val_score:.4f}')
 
         if val_score > best_score:
             best_score = val_score
@@ -425,31 +493,40 @@ def run_training(args):
             logging.info(f'best model! (Score: {best_score:.4f})')
         else:
             patience_counter += 1
-            logging.info(f'early stop count: {patience_counter}/{args.patience}')
+            logging.info(f'early stop: {patience_counter}/{args.patience}')
             if patience_counter >= args.patience:
-                logging.info(f'{args.patience} epoch not up, early stop!')
+                logging.info(f'{args.patience} epochs no improvement, early stop!')
                 break
 
-    logging.info(f'train finish, best score: {best_score:.4f}')
+    logging.info(f'training finished. best score: {best_score:.4f}')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_dir', type=str, default="./dataset/Train_Set")
     parser.add_argument('--output_dir', type=str, default='./cpa_output')
-    parser.add_argument('--shortcut_name', type=str, default='bert-base-uncased')
+    parser.add_argument('--shortcut_name', type=str, default='roberta-base')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epoch', type=int, default=20)
-    parser.add_argument('--lr', type=float, default=5e-5)
+    parser.add_argument('--lr', type=float, default=3e-5)
     parser.add_argument('--max_length', type=int, default=128)
     parser.add_argument('--random_seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--use_amp', action='store_true')
     parser.add_argument('--warmup_ratio', type=float, default=0.1)
-    parser.add_argument('--patience', type=int, default=3)
+    parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--val_ratio', type=float, default=0.1)
     parser.add_argument('--device', type=str, default='gpu')
-    parser.add_argument('--weight_decay', type=float, default=0.0)
+    parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--dropout', type=float, default=0.1)
+    # Dual-encoder contrastive loss weight
+    parser.add_argument('--contrastive_alpha', type=float, default=0.3,
+                        help='Weight for contrastive prototype loss')
+    # R-Drop consistency loss weight
+    parser.add_argument('--rdrop_alpha', type=float, default=0.5,
+                        help='Weight for R-Drop KL-divergence loss')
+    # Inference: how much to trust contrastive logits vs classifier logits
+    parser.add_argument('--contrastive_beta', type=float, default=0.5,
+                        help='Weight for contrastive logits at inference time')
     args = parser.parse_args()
     run_training(args)
